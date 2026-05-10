@@ -5,13 +5,23 @@ import re
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, StateGraph
 
+from orchestrator import format_missing_message, missing_required_slots
 from prompt import evaluate_json_prompt, extract_json_prompt
 from state import QueryState
 
-extractor_llm = evaluator_llm = ChatOllama(
-    model=os.getenv("EXTRACTOR_LLM_MODEL", "llama3.2"),
-    base_url="http://127.0.0.1:11434",
+_OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+_DEFAULT_MODEL = os.getenv("EXTRACTOR_LLM_MODEL", "llama3.2")
+
+extractor_llm = ChatOllama(
+    model=_DEFAULT_MODEL,
+    base_url=_OLLAMA_BASE,
 )
+
+evaluator_llm = ChatOllama(
+    model=os.getenv("EVALUATOR_LLM_MODEL", _DEFAULT_MODEL),
+    base_url=_OLLAMA_BASE,
+)
+
 
 def _extract_json(text: str) -> dict:
     try:
@@ -87,16 +97,13 @@ def _query_has_explicit_km(query: str) -> bool:
 def _extract_km_from_query(query: str):
     q = query.lower().replace(",", "")
 
-    # Prefer explicit "zero km" wording.
     if re.search(r"\bzero\s*km\b", q):
         return 0
 
-    # Match values with "k" suffix first (e.g., 80k, 80k km).
     match_k = re.search(r"\b(\d+(?:\.\d+)?)\s*k\b(?:\s*km)?", q)
     if match_k:
         return int(float(match_k.group(1)) * 1000)
 
-    # Then match plain kilometers (e.g., 80 km, 189000 km).
     match_km = re.search(r"\b(\d+)\s*km\b", q)
     if match_km:
         return int(match_km.group(1))
@@ -106,7 +113,6 @@ def _extract_km_from_query(query: str):
 
 def _enforce_query_grounding(query: str, extracted: dict) -> dict:
     grounded = dict(extracted)
-    # Prevent model from inventing mileage values not present in query.
     if _query_implies_new_car(query):
         grounded["km"] = 0
     else:
@@ -131,29 +137,48 @@ def extraction_agent(state: QueryState) -> QueryState:
     }
 
 
+def _run_single_evaluator_pass(query: str, first_json: dict, chain) -> dict:
+    response = chain.invoke(
+        {
+            "query": query,
+            "first_extracted": json.dumps(first_json, ensure_ascii=False),
+        }
+    )
+    evaluated_data = _extract_json(_llm_content_to_text(response.content))
+    corrected = _normalize_extracted(evaluated_data.get("corrected", {}))
+    return _enforce_query_grounding(query, corrected)
+
+
 def evaluator_agent(state: QueryState) -> QueryState:
+    """
+    Second agent: refine JSON; may call the evaluator LLM several times on the
+    same user ``query``, feeding the latest corrected JSON as ``first_extracted``,
+    until required slots are filled or there is no shrink in ``missing`` / cap.
+    """
     query = state.get("query", "")
     first_extracted = state.get("extracted", {})
 
     chain = evaluate_json_prompt | evaluator_llm
-    response = chain.invoke(
-        {
-            "query": query,
-            "first_extracted": json.dumps(first_extracted, ensure_ascii=False),
-        }
-    )
-    evaluated_data = _extract_json(_llm_content_to_text(response.content))
+    max_passes = max(1, int(os.getenv("EVALUATOR_MAX_PASSES", "3")))
 
-    corrected = _normalize_extracted(evaluated_data.get("corrected", {}))
-    corrected = _enforce_query_grounding(query, corrected)
-    missing_required = [
-        key for key in ["maker", "model", "year", "km"] if corrected.get(key) is None
-    ]
-    ask_user = ""
-    if missing_required:
-        ask_user = (
-            "Please add missing required info: " + ", ".join(missing_required) + "."
-        )
+    corrected = _run_single_evaluator_pass(query, first_extracted, chain)
+    prev_missing = missing_required_slots(corrected)
+
+    for _ in range(1, max_passes):
+        if not prev_missing:
+            break
+        next_json = dict(corrected)
+        candidate = _run_single_evaluator_pass(query, next_json, chain)
+        new_missing = missing_required_slots(candidate)
+        if new_missing == prev_missing:
+            break
+        if len(new_missing) > len(prev_missing):
+            break
+        corrected = candidate
+        prev_missing = new_missing
+
+    missing_required = missing_required_slots(corrected)
+    ask_user = format_missing_message(missing_required) if missing_required else ""
 
     return {
         "query": query,
@@ -164,6 +189,7 @@ def evaluator_agent(state: QueryState) -> QueryState:
     }
 
 
+# Orchestrator graph: START → extractor_agent → evaluator_agent → END
 builder = StateGraph(QueryState)
 builder.add_node("extractor_agent", extraction_agent)
 builder.add_node("evaluator_agent", evaluator_agent)

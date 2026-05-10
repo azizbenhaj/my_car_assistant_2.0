@@ -111,6 +111,9 @@ Rules:
    - manual/stick/stick shift => manual
 6) electric cars imply automatic gearbox
 7) If first value is null, you may fill it only with strong evidence from query.
+8) REQUIRED handoff fields (must be non-null whenever the query supports inference):
+   intent, maker, model, year, km. Infer intent from buying vs selling vs price-check language;
+   leave null only when truly impossible from the text.
 
 Example 1:
 Input: "Sell my 2018 BMW X3 diesel, auto"

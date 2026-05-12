@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 .env
+.saved_car_sessions.json
+.pending_listings_choice.json

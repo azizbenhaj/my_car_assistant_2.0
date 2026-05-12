@@ -1,45 +1,87 @@
 import json
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 import streamlit as st
 from graph import graph
 import listings_present as lp
 from listings_retrieval import fetch_top_listings
 from orchestrator import format_missing_message
-from results_router import classify_results_style
 
 MAX_SAVED_SESSIONS = 10
 MAX_COMPARE_CARS = 3
+
+_APP_DIR = Path(__file__).resolve().parent
+_SAVED_SESSIONS_PATH = _APP_DIR / ".saved_car_sessions.json"
+
+# Only evaluator fields — never persist / replay listing UI keys on saved profiles.
+_VEHICLE_PROFILE_KEYS: frozenset[str] = frozenset(
+    {"intent", "maker", "model", "year", "km", "fuel", "gearbox"}
+)
+
+
+def _sanitize_vehicle_profile(raw: dict | None) -> dict:
+    if not raw:
+        return {}
+    return {k: raw[k] for k in _VEHICLE_PROFILE_KEYS if k in raw and raw[k] is not None}
+
+
+def _load_saved_car_sessions() -> list:
+    try:
+        raw = _SAVED_SESSIONS_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            return []
+        cleaned: list = []
+        for item in data[:MAX_SAVED_SESSIONS]:
+            if not isinstance(item, dict):
+                continue
+            row = dict(item)
+            if "vehicle_json" in row:
+                row["vehicle_json"] = _sanitize_vehicle_profile(row.get("vehicle_json"))
+            ls = row.get("listing_snapshot")
+            if isinstance(ls, dict) and isinstance(ls.get("evaluated_snapshot"), dict):
+                ls = dict(ls)
+                ls["evaluated_snapshot"] = _sanitize_vehicle_profile(ls.get("evaluated_snapshot"))
+                row["listing_snapshot"] = ls
+            cleaned.append(row)
+        return cleaned
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return []
+
+
+def _persist_saved_car_sessions() -> None:
+    try:
+        _SAVED_SESSIONS_PATH.write_text(
+            json.dumps(st.session_state.saved_car_sessions, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 
 def _listing_response_fields(
     merged: dict, listings_rows: list | None, listings_err: str | None
 ) -> dict:
-    """Side effects on listings_bundle / awaiting_results_choice; extra keys for assistant turn."""
+    """When DB returns rows: auto quick view + PDF; then lock buy/sell chat (session done)."""
     if listings_err:
-        st.session_state.awaiting_results_choice = False
-        st.session_state.listings_bundle = None
-        st.session_state.listings_quick_deep_turn_done = False
         return {"listings_error": listings_err}
     if not listings_rows:
-        st.session_state.awaiting_results_choice = False
-        st.session_state.listings_bundle = None
-        st.session_state.listings_quick_deep_turn_done = False
         return {"listings_empty": True}
 
-    st.session_state.listings_quick_deep_turn_done = False
     scored = lp.enrich_listing_pool(merged, listings_rows)
-    st.session_state.listings_bundle = {
-        "evaluated": dict(merged),
-        "enriched": scored,
-    }
-    st.session_state.awaiting_results_choice = True
+    n_show = lp.AUTO_QUICK_CARD_COUNT
+    top = scored[:n_show]
+    slim = lp.slim_enriched(top, max_rows=n_show)
+    st.session_state.buy_sell_chat_locked = True
+    st.session_state.sidebar_delete_disabled = False
     return {
-        "listing_choice_prompt": True,
+        "results_style": "quick",
         "listing_count": len(scored),
         "evaluated_snapshot": dict(merged),
-        "enriched_slim": lp.slim_enriched(scored),
+        "enriched_slim": slim,
     }
 
 
@@ -50,20 +92,15 @@ def _render_message_listing_extras(msg: dict, turn_key: str) -> None:
     if msg.get("listings_empty"):
         st.info("No listings matched these filters in the database.")
         return
-    if msg.get("listing_choice_prompt"):
-        n = int(msg.get("listing_count") or 0)
-        st.success(f"Matched **{n}** listing(s). How should we display them?")
-        st.markdown(lp.CHOICE_PROMPT_MARKDOWN)
-        return
     rs = msg.get("results_style")
     if rs in ("quick", "deep"):
         slim = msg.get("enriched_slim") or []
         ev = msg.get("evaluated_snapshot") or {}
         if rs == "quick":
-            lp.render_quick_cards(slim)
-            qp = lp.quick_cards_pdf_bytes(slim, ev)
+            lp.render_quick_cards(slim, limit=lp.AUTO_QUICK_CARD_COUNT)
+            qp = lp.quick_cards_pdf_bytes(slim, ev, n=lp.AUTO_QUICK_CARD_COUNT)
             st.download_button(
-                label="Download compact PDF (10 cars, photos & links)",
+                label=f"Download PDF (top {lp.AUTO_QUICK_CARD_COUNT} cars, photos & links)",
                 data=qp,
                 file_name="car_listings_quick.pdf",
                 mime="application/pdf",
@@ -79,6 +116,18 @@ def _render_message_listing_extras(msg: dict, turn_key: str) -> None:
                 mime="application/pdf",
                 key=f"pdf_dl_{turn_key}",
             )
+
+
+def _append_listing_summary_to_assistant_text(turn: dict, listing_extras: dict) -> None:
+    if listing_extras.get("results_style") != "quick":
+        return
+    n = int(listing_extras.get("listing_count") or 0)
+    k = lp.AUTO_QUICK_CARD_COUNT
+    turn["text"] = (
+        str(turn.get("text") or "").rstrip()
+        + f" Matched **{n}** listings — **{k}** closest below (photos) + PDF. "
+        "**Chat is closed for this run** — use **Start over (new goal)** or **Load** a saved car when you want to go again."
+    )
 
 
 def _utc_now_iso() -> str:
@@ -99,26 +148,61 @@ def _vehicle_signature(vehicle: dict) -> str:
     return json.dumps(subset, sort_keys=True, ensure_ascii=False)
 
 
-def _maybe_autosave_completed_session(vehicle: dict) -> None:
-    """When a single-car flow finishes required fields, record one sidebar session (deduped)."""
+def _listing_snapshot_from_extras(listing_extras: dict | None) -> dict | None:
+    """JSON-safe blob to restore quick cards + PDF on Load."""
+    if not listing_extras or listing_extras.get("results_style") != "quick":
+        return None
+    ev = listing_extras.get("evaluated_snapshot") or {}
+    slim = listing_extras.get("enriched_slim") or []
+    try:
+        return json.loads(
+            json.dumps(
+                {
+                    "results_style": "quick",
+                    "listing_count": int(listing_extras.get("listing_count") or 0),
+                    "evaluated_snapshot": dict(ev),
+                    "enriched_slim": slim,
+                },
+                default=str,
+            )
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _maybe_autosave_completed_session(
+    vehicle: dict, listing_extras: dict | None = None
+) -> None:
+    """Save or update a sidebar session; attach listing snapshot when quick view + PDF was shown."""
     sig = _vehicle_signature(vehicle)
+    snap = _listing_snapshot_from_extras(listing_extras)
+
     if sig == st.session_state.last_autosaved_signature:
+        if snap:
+            for row in st.session_state.saved_car_sessions:
+                if _vehicle_signature(row.get("vehicle_json") or {}) == sig:
+                    row["listing_snapshot"] = snap
+                    row["saved_at"] = _utc_now_iso()
+                    break
+            _persist_saved_car_sessions()
         return
+
     st.session_state.last_autosaved_signature = sig
     label = _make_session_label(vehicle)
     sid = str(uuid.uuid4())
-    st.session_state.saved_car_sessions.insert(
-        0,
-        {
-            "id": sid,
-            "label": label,
-            "vehicle_json": dict(vehicle),
-            "saved_at": _utc_now_iso(),
-        },
-    )
+    entry: dict = {
+        "id": sid,
+        "label": label,
+        "vehicle_json": _sanitize_vehicle_profile(dict(vehicle)),
+        "saved_at": _utc_now_iso(),
+    }
+    if snap:
+        entry["listing_snapshot"] = snap
+    st.session_state.saved_car_sessions.insert(0, entry)
     st.session_state.saved_car_sessions = st.session_state.saved_car_sessions[
         :MAX_SAVED_SESSIONS
     ]
+    _persist_saved_car_sessions()
 
 
 def _intent_preamble_buy_sell() -> str:
@@ -133,46 +217,158 @@ def _intent_preamble_buy_sell() -> str:
     )
 
 
+def _build_compare_sessions_from_ids(picked_ids: list[str]) -> list[dict]:
+    """Load up to 20 enriched listings per saved car (snapshot or live fetch)."""
+    by_id = {s["id"]: s for s in st.session_state.saved_car_sessions}
+    out: list[dict] = []
+    for pid in picked_ids:
+        sess = by_id.get(pid)
+        if not sess:
+            continue
+        vehicle = dict(sess.get("vehicle_json") or {})
+        evaluated = dict(vehicle)
+        slim: list = []
+        snap = sess.get("listing_snapshot")
+        if isinstance(snap, dict):
+            ev = snap.get("evaluated_snapshot")
+            if isinstance(ev, dict) and ev:
+                evaluated = {**evaluated, **ev}
+            es = snap.get("enriched_slim")
+            if isinstance(es, list) and es:
+                slim = list(es)[:20]
+        if len(slim) < 1:
+            rows, err = fetch_top_listings(evaluated, limit=50)
+            if not err and rows:
+                scored = lp.enrich_listing_pool(evaluated, rows)
+                slim = lp.slim_enriched(scored[:20], max_rows=20)
+        out.append(
+            {
+                "id": sess["id"],
+                "label": str(sess.get("label") or _make_session_label(vehicle)),
+                "vehicle_json": _sanitize_vehicle_profile(vehicle),
+                "evaluated_snapshot": evaluated,
+                "enriched_slim": slim,
+            }
+        )
+    return out
+
+
 def _reset_flow() -> None:
     st.session_state.flow_mode = None
     st.session_state.preferred_intent = None
     st.session_state.compare_cars = []
+    st.session_state.compare_sessions = []
     st.session_state.compare_built = False
     st.session_state.base_json = {}
     st.session_state.missing_required_fields = []
     st.session_state.chat_history = []
     st.session_state.last_autosaved_signature = None
     st.session_state.pop("compare_multiselect", None)
-    st.session_state.awaiting_results_choice = False
-    st.session_state.listings_bundle = None
-    st.session_state.listings_quick_deep_turn_done = False
+    st.session_state.pop("_sidebar_pdf_cache", None)
+    st.session_state.sidebar_delete_disabled = False
+    st.session_state.buy_sell_chat_locked = False
 
 
 def _apply_loaded_session(sess: dict) -> None:
     st.session_state.flow_mode = "single"
-    st.session_state.preferred_intent = sess["vehicle_json"].get("intent")
-    st.session_state.base_json = dict(sess["vehicle_json"])
+    vj = _sanitize_vehicle_profile(sess.get("vehicle_json"))
+    st.session_state.preferred_intent = vj.get("intent")
+    st.session_state.base_json = dict(vj)
     st.session_state.missing_required_fields = []
     st.session_state.compare_built = False
     st.session_state.compare_cars = []
-    st.session_state.awaiting_results_choice = False
-    st.session_state.listings_bundle = None
-    st.session_state.listings_quick_deep_turn_done = False
-    st.session_state.chat_history = [
-        {
-            "role": "assistant",
-            "text": (
-                f"Loaded saved car **{sess['label']}**. "
-                "Ask for listings again, PDF/statistics when we support them, or refine details in chat."
-            ),
-        }
-    ]
+    st.session_state.compare_sessions = []
+    st.session_state.sidebar_delete_disabled = False
+    st.session_state.last_autosaved_signature = _vehicle_signature(vj)
+    if "car_assistant_chat_input" in st.session_state:
+        del st.session_state["car_assistant_chat_input"]
+
+    snap = sess.get("listing_snapshot")
+    if (
+        isinstance(snap, dict)
+        and snap.get("results_style") == "quick"
+        and isinstance(snap.get("enriched_slim"), list)
+        and snap["enriched_slim"]
+    ):
+        ev_snap = _sanitize_vehicle_profile(snap.get("evaluated_snapshot")) or dict(vj)
+        n = int(snap.get("listing_count") or 0)
+        k = lp.AUTO_QUICK_CARD_COUNT
+        st.session_state.buy_sell_chat_locked = True
+        st.session_state.chat_history = [
+            {
+                "role": "assistant",
+                "text": (
+                    f"Loaded saved car **{sess['label']}** — **restored** the last marketplace view "
+                    f"(**{k}** closest matches, photos, PDF). Matched **{n}** listings in that run. "
+                    "**Chat is closed** — use **Start over (new goal)** for a new search."
+                ),
+                "results_style": "quick",
+                "listing_count": n,
+                "evaluated_snapshot": dict(ev_snap),
+                "enriched_slim": snap["enriched_slim"],
+            }
+        ]
+    else:
+        st.session_state.buy_sell_chat_locked = False
+        st.session_state.chat_history = [
+            {
+                "role": "assistant",
+                "text": (
+                    f"Loaded saved car **{sess['label']}**. "
+                    "No saved listing snapshot for this save — vehicle JSON only. "
+                    "Use **Start over** then describe the car again to fetch listings, or complete a "
+                    "run once to store cards + PDF with this profile."
+                ),
+            }
+        ]
 
 
 def _delete_session(session_id: str) -> None:
     st.session_state.saved_car_sessions = [
         s for s in st.session_state.saved_car_sessions if s["id"] != session_id
     ]
+    st.session_state.get("_sidebar_pdf_cache", {}).pop(session_id, None)
+    _persist_saved_car_sessions()
+
+
+def _pdf_bytes_for_saved_session(sess: dict) -> tuple[bytes | None, str | None]:
+    """Quick-listings PDF bytes: snapshot if present, else live DB fetch + enrich."""
+    vehicle = dict(sess.get("vehicle_json") or {})
+    if not vehicle:
+        return None, "No vehicle profile in this save."
+    evaluated = dict(vehicle)
+    slim: list = []
+    snap = sess.get("listing_snapshot")
+    if isinstance(snap, dict):
+        ev = snap.get("evaluated_snapshot")
+        if isinstance(ev, dict) and ev:
+            evaluated = {**evaluated, **ev}
+        es = snap.get("enriched_slim")
+        if isinstance(es, list) and es:
+            slim = list(es)
+    if not slim:
+        rows, err = fetch_top_listings(evaluated, limit=50)
+        if err:
+            return None, err
+        if not rows:
+            return None, "No DB matches for this profile (check DATABASE_URL and filters)."
+        scored = lp.enrich_listing_pool(evaluated, rows)
+        slim = lp.slim_enriched(scored[: lp.AUTO_QUICK_CARD_COUNT], max_rows=lp.AUTO_QUICK_CARD_COUNT)
+    if not slim:
+        return None, "No listing rows to put in the PDF."
+    try:
+        b = lp.quick_cards_pdf_bytes(slim, evaluated, n=lp.AUTO_QUICK_CARD_COUNT)
+    except Exception as ex:
+        return None, str(ex) or "PDF build failed."
+    if not b or len(b) < 200:
+        return None, "PDF build returned empty output."
+    return b, None
+
+
+def _safe_pdf_filename(label: str, session_id: str) -> str:
+    base = "".join(c if c.isalnum() or c in " -_" else "_" for c in (label or "car").strip())[:40] or "car"
+    short = (session_id or "id")[:8]
+    return f"{base.replace(' ', '_')}_{short}_listings.pdf"
 
 
 st.set_page_config(page_title="Car Assistant Chatbot", page_icon="🚗")
@@ -194,29 +390,21 @@ if "compare_cars" not in st.session_state:
     st.session_state.compare_cars = []
 if "compare_built" not in st.session_state:
     st.session_state.compare_built = False
+if "compare_sessions" not in st.session_state:
+    st.session_state.compare_sessions = []
 if "saved_car_sessions" not in st.session_state:
-    st.session_state.saved_car_sessions = []
+    st.session_state.saved_car_sessions = _load_saved_car_sessions()
 if len(st.session_state.saved_car_sessions) > MAX_SAVED_SESSIONS:
     st.session_state.saved_car_sessions = st.session_state.saved_car_sessions[
         :MAX_SAVED_SESSIONS
     ]
+    _persist_saved_car_sessions()
 if "last_autosaved_signature" not in st.session_state:
     st.session_state.last_autosaved_signature = None
-if "awaiting_results_choice" not in st.session_state:
-    st.session_state.awaiting_results_choice = False
-if "listings_bundle" not in st.session_state:
-    st.session_state.listings_bundle = None
-if "listings_quick_deep_turn_done" not in st.session_state:
-    st.session_state.listings_quick_deep_turn_done = False
-
-_LISTINGS_TURN_CLOSED = (
-    "This marketplace run is **finished** (quick or extended/deep view is above). "
-    "Tap **Start over (new goal)** in the sidebar to clear the chat and run a **new** search."
-)
-_LISTINGS_ACK_TAIL = (
-    "\n\n**This marketplace run is complete.** "
-    "Tap **Start over (new goal)** in the sidebar when you want a new search."
-)
+if "sidebar_delete_disabled" not in st.session_state:
+    st.session_state.sidebar_delete_disabled = False
+if "buy_sell_chat_locked" not in st.session_state:
+    st.session_state.buy_sell_chat_locked = False
 
 with st.sidebar:
     st.markdown("### Saved cars")
@@ -238,17 +426,47 @@ with st.sidebar:
                         _apply_loaded_session(sess)
                         st.rerun()
                 with c2:
-                    if st.button("PDF", key=f"pdf_{sess['id']}", use_container_width=True):
-                        st.session_state["_pdf_stub"] = sess["id"]
+                    pdf_cache = st.session_state.setdefault("_sidebar_pdf_cache", {})
+                    sid = sess["id"]
+                    cached = pdf_cache.get(sid)
+                    pdf_b: bytes | None = None
+                    pdf_err: str | None = None
+                    if isinstance(cached, bytes) and len(cached) > 200:
+                        pdf_b = cached
+                    else:
+                        b, err = _pdf_bytes_for_saved_session(sess)
+                        if b is not None:
+                            pdf_cache[sid] = b
+                            pdf_b = b
+                        else:
+                            pdf_err = err or "Unavailable"
+                    if pdf_b is not None:
+                        st.download_button(
+                            label="PDF",
+                            data=pdf_b,
+                            file_name=_safe_pdf_filename(str(sess.get("label") or "car"), sid),
+                            mime="application/pdf",
+                            key=f"pdf_dl_{sid}",
+                            use_container_width=True,
+                        )
+                    else:
+                        st.button(
+                            "PDF",
+                            key=f"pdf_na_{sid}",
+                            use_container_width=True,
+                            disabled=True,
+                            help=(pdf_err or "PDF unavailable")[:220],
+                        )
                 with c3:
-                    if st.button("Del", key=f"del_{sess['id']}", use_container_width=True):
+                    if st.button(
+                        "Del",
+                        key=f"del_{sess['id']}",
+                        use_container_width=True,
+                        disabled=st.session_state.get("sidebar_delete_disabled", False),
+                    ):
                         _delete_session(sess["id"])
                         st.rerun()
             st.divider()
-
-    if st.session_state.get("_pdf_stub"):
-        sid = st.session_state.pop("_pdf_stub")
-        st.info("PDF export is not wired yet — this will use the selected saved car when it is.")
 
     st.markdown("---")
     st.markdown("### Session")
@@ -270,9 +488,10 @@ with st.sidebar:
         )
         if st.session_state.flow_mode == "compare":
             if st.session_state.compare_built:
-                st.caption(f"Comparison: **{len(st.session_state.compare_cars)}** car(s)")
+                ncmp = len(st.session_state.get("compare_sessions") or st.session_state.compare_cars)
+                st.caption(f"Comparison: **{ncmp}** car(s)")
             else:
-                st.caption("Pick **1–3** saved cars, then build comparison.")
+                st.caption("Pick **2 or 3** saved cars, then **Compare**.")
     if st.button("Start over (new goal)"):
         _reset_flow()
         st.rerun()
@@ -306,9 +525,9 @@ if st.session_state.flow_mode is None:
             st.session_state.missing_required_fields = []
             st.session_state.compare_built = False
             st.session_state.compare_cars = []
-            st.session_state.awaiting_results_choice = False
-            st.session_state.listings_bundle = None
-            st.session_state.listings_quick_deep_turn_done = False
+            st.session_state.compare_sessions = []
+            st.session_state.sidebar_delete_disabled = False
+            st.session_state.buy_sell_chat_locked = False
             st.session_state.chat_history.append(
                 {
                     "role": "assistant",
@@ -324,19 +543,17 @@ if st.session_state.flow_mode is None:
             st.session_state.flow_mode = "compare"
             st.session_state.compare_built = False
             st.session_state.compare_cars = []
+            st.session_state.compare_sessions = []
             st.session_state.base_json = {}
             st.session_state.missing_required_fields = []
-            st.session_state.awaiting_results_choice = False
-            st.session_state.listings_bundle = None
-            st.session_state.listings_quick_deep_turn_done = False
+            st.session_state.sidebar_delete_disabled = False
+            st.session_state.buy_sell_chat_locked = False
             st.session_state.chat_history.append(
                 {
                     "role": "assistant",
                     "text": (
-                        "Use the **comparison panel** below: choose **up to three** saved cars from the "
-                        "sidebar list (they appear in the multiselect). **Selection order is comparison "
-                        "order** — pick the first car first, then the second, then the third. "
-                        "*(Streamlit can’t drag from the sidebar; use the ordered multiselect.)*"
+                        "**Compare** — pick **two or three** saved cars in the panel below (order = chart "
+                        "colors: blue, red, green), then press **Compare**. Chat stays off here."
                     ),
                 }
             )
@@ -346,10 +563,6 @@ if st.session_state.flow_mode is None:
         "Compare uses profiles you already saved from completed extractions."
     )
 else:
-    st.caption(
-        "Orchestrator: extractor → evaluator. Required JSON: intent, maker, model, km, year. "
-        "Compare uses saved sessions only (no typing three cars in chat)."
-    )
     if st.session_state.flow_mode == "single":
         st.markdown("---")
         st.write("Examples you can riff on:")
@@ -363,52 +576,49 @@ else:
 
 if st.session_state.flow_mode == "compare":
     st.markdown("### Compare cars")
-    if not st.session_state.saved_car_sessions:
+    n_saved = len(st.session_state.saved_car_sessions)
+    if n_saved < 2:
         st.warning(
-            "You need at least **one saved car**. Finish a **Buy or sell a car** chat until all "
-            "required fields are present — it will appear under **Saved cars** in the sidebar."
+            "You need at least **two saved cars** (each from a completed **Buy or sell a car** run). "
+            "They appear under **Saved cars** in the sidebar."
         )
     elif not st.session_state.compare_built:
         labels_by_id = {s["id"]: s["label"] for s in st.session_state.saved_car_sessions}
         ids = [s["id"] for s in st.session_state.saved_car_sessions]
         picked = st.multiselect(
-            f"Choose **1–{MAX_COMPARE_CARS}** saved cars (order = left-to-right in the comparison)",
+            f"Select **2 or 3** saved cars (order = **1st → blue**, **2nd → red**, **3rd → green** in charts)",
             options=ids,
             default=[],
             format_func=lambda i: labels_by_id.get(i, i),
             max_selections=MAX_COMPARE_CARS,
             key="compare_multiselect",
         )
-        if st.button("Build comparison", type="primary"):
-            if not picked:
-                st.error("Pick at least one saved car.")
+        n_pick = len(picked)
+        if st.button(
+            "Compare",
+            type="primary",
+            disabled=n_pick < 2,
+            key="compare_run_btn",
+            help="Select at least two saved cars to enable Compare.",
+        ):
+            sessions = _build_compare_sessions_from_ids(list(picked))
+            if len(sessions) < 2:
+                st.error("Could not load at least two car profiles with the current selection.")
             else:
-                by_id = {s["id"]: s for s in st.session_state.saved_car_sessions}
+                st.session_state.compare_sessions = sessions
                 st.session_state.compare_cars = [
-                    dict(by_id[i]["vehicle_json"]) for i in picked if i in by_id
+                    _sanitize_vehicle_profile(dict(s.get("vehicle_json") or {})) for s in sessions
                 ]
                 st.session_state.compare_built = True
-                st.session_state.chat_history.append(
-                    {
-                        "role": "assistant",
-                        "text": (
-                            f"**Comparison ready** — {len(st.session_state.compare_cars)} car(s). "
-                            "Retrieval / PDF across profiles is still on the backlog."
-                        ),
-                    }
-                )
                 st.rerun()
     else:
-        n = len(st.session_state.compare_cars)
-        st.success(f"Showing **{n}** profile(s).")
-        cols = st.columns(max(n, 1))
-        for i, car in enumerate(st.session_state.compare_cars):
-            with cols[i]:
-                st.subheader(_make_session_label(car))
-                st.json(car)
-        if st.button("Change car selection"):
+        n = len(st.session_state.compare_sessions or st.session_state.compare_cars)
+        st.success(f"Comparing **{n}** saved car(s).")
+        lp.render_compare_dashboard(list(st.session_state.compare_sessions or []))
+        if st.button("Change selection", key="compare_change_btn"):
             st.session_state.compare_built = False
             st.session_state.compare_cars = []
+            st.session_state.compare_sessions = []
             st.session_state.pop("compare_multiselect", None)
             st.rerun()
     st.markdown("---")
@@ -417,46 +627,48 @@ if st.session_state.flow_mode == "compare":
 for turn_i, msg in enumerate(st.session_state.chat_history):
     with st.chat_message(msg["role"]):
         st.write(msg["text"])
-        if msg.get("first_json") is not None:
-            st.caption("First Extracted JSON")
-            st.json(msg["first_json"])
-        if msg.get("second_json") is not None:
-            label = msg.get("json_caption_ev", "Second (Evaluator Corrected) JSON")
-            st.caption(label)
-            st.json(msg["second_json"])
         if msg.get("warning"):
             st.warning(msg["warning"])
         if msg.get("role") == "assistant" and (
             msg.get("listings_error")
             or msg.get("listings_empty")
-            or msg.get("listing_choice_prompt")
             or msg.get("results_style")
         ):
             _render_message_listing_extras(msg, f"h{turn_i}")
 
-chat_placeholder = "Choose an option above first..."
+chat_placeholder = (
+    "Pick **Buy or sell a car** above to enable chat. **Compare cars** uses only the panel "
+    "(multiselect + **Compare**) — no chat here."
+)
 if (
     st.session_state.flow_mode == "single"
-    and st.session_state.get("listings_quick_deep_turn_done")
+    and st.session_state.get("buy_sell_chat_locked")
 ):
     chat_placeholder = (
-        "This search is complete (results above). Use Start over (new goal) in the sidebar."
+        "This run is complete (listings + PDF above). Use **Start over (new goal)** or **Load** "
+        "a saved car to continue."
     )
-elif (
-    st.session_state.flow_mode == "single"
-    and st.session_state.get("awaiting_results_choice")
-    and st.session_state.get("listings_bundle")
-):
-    chat_placeholder = "Quick cards (top 10) or deep analysis + PDF? Reply in plain language."
 elif st.session_state.flow_mode == "single":
-    chat_placeholder = "Buying or selling? Describe the car..."
+    chat_placeholder = "Buying or selling? Describe the car…"
 elif st.session_state.flow_mode == "compare":
-    if not st.session_state.compare_built:
-        chat_placeholder = "Use the comparison panel above — multiselect saved cars, then Build."
-    else:
-        chat_placeholder = "Comparison follow-up chat is not wired yet."
+    chat_placeholder = (
+        "Chat is disabled in **Compare cars**. Use the panel above, or **Start over (new goal)** "
+        "to use buy/sell chat."
+    )
 
-user_input = st.chat_input(chat_placeholder)
+_chat_disabled = (
+    st.session_state.flow_mode is None
+    or st.session_state.flow_mode == "compare"
+    or (
+        st.session_state.flow_mode == "single"
+        and st.session_state.get("buy_sell_chat_locked")
+    )
+)
+user_input = st.chat_input(
+    chat_placeholder,
+    key="car_assistant_chat_input",
+    disabled=_chat_disabled,
+)
 
 if user_input:
     text = user_input.strip()
@@ -468,84 +680,6 @@ if user_input:
                 "text": "Please tap **Buy or sell a car** or **Compare cars** above so I know how to help.",
             }
         )
-        st.stop()
-
-    if st.session_state.flow_mode == "compare":
-        st.session_state.chat_history.append({"role": "user", "text": text})
-        with st.chat_message("user"):
-            st.write(text)
-        if not st.session_state.compare_built:
-            hint = (
-                "In **Compare** mode, pick saved cars in the panel above (in the order you want them "
-                "compared) and tap **Build comparison**."
-            )
-        else:
-            hint = "Questions that reference this comparison aren’t wired to the LLM yet — backlog."
-        st.session_state.chat_history.append(
-            {
-                "role": "assistant",
-                "text": hint,
-            }
-        )
-        with st.chat_message("assistant"):
-            st.write(st.session_state.chat_history[-1]["text"])
-        st.stop()
-
-    if (
-        st.session_state.flow_mode == "single"
-        and st.session_state.get("listings_quick_deep_turn_done")
-        and not st.session_state.get("awaiting_results_choice")
-    ):
-        st.session_state.chat_history.append({"role": "user", "text": text})
-        with st.chat_message("user"):
-            st.write(text)
-        st.session_state.chat_history.append(
-            {"role": "assistant", "text": _LISTINGS_TURN_CLOSED}
-        )
-        with st.chat_message("assistant"):
-            st.write(_LISTINGS_TURN_CLOSED)
-        st.stop()
-
-    if (
-        st.session_state.flow_mode == "single"
-        and st.session_state.get("awaiting_results_choice")
-        and st.session_state.get("listings_bundle")
-    ):
-        st.session_state.chat_history.append({"role": "user", "text": text})
-        with st.chat_message("user"):
-            st.write(text)
-
-        bundle = st.session_state.listings_bundle
-        evaluated = bundle["evaluated"]
-        enriched = bundle["enriched"]
-        slim = lp.slim_enriched(enriched)
-
-        style = classify_results_style(text)
-        ack = (
-            "Here are the **10 most similar** cars in a compact card layout." + _LISTINGS_ACK_TAIL
-            if style == "quick"
-            else (
-                "Here’s the **deep / extended** view — table with match % / tolerances, stats, maps, "
-                "trends, and PDF."
-                + _LISTINGS_ACK_TAIL
-            )
-        )
-        assistant_turn = {
-            "role": "assistant",
-            "text": ack,
-            "results_style": style,
-            "enriched_slim": slim,
-            "evaluated_snapshot": dict(evaluated),
-        }
-        st.session_state.chat_history.append(assistant_turn)
-        st.session_state.awaiting_results_choice = False
-        st.session_state.listings_bundle = None
-        st.session_state.listings_quick_deep_turn_done = True
-
-        live_k = f"l{len(st.session_state.chat_history) - 1}"
-        with st.chat_message("assistant"):
-            st.write(ack)
-            _render_message_listing_extras(assistant_turn, live_k)
         st.stop()
 
     st.session_state.chat_history.append({"role": "user", "text": text})
@@ -604,23 +738,17 @@ if user_input:
         assistant_turn = {
             "role": "assistant",
             "text": "Updated your previous extraction using only missing fields.",
-            "first_json": base_json,
-            "second_json": merged,
-            "json_caption_ev": "Second (Evaluator Corrected) JSON",
             "warning": warning_msg,
             **listing_extras,
         }
+        _append_listing_summary_to_assistant_text(assistant_turn, listing_extras)
         st.session_state.chat_history.append(assistant_turn)
 
         if not still_missing:
-            _maybe_autosave_completed_session(merged)
+            _maybe_autosave_completed_session(merged, listing_extras)
 
         with st.chat_message("assistant"):
             st.write(assistant_turn["text"])
-            st.caption("Previous JSON")
-            st.json(base_json)
-            st.caption(assistant_turn["json_caption_ev"])
-            st.json(merged)
             if still_missing:
                 st.warning(warning_msg)
             else:
@@ -628,6 +756,8 @@ if user_input:
             if not still_missing and retrieve_listings and listing_extras:
                 lk = f"l{len(st.session_state.chat_history) - 1}"
                 _render_message_listing_extras(assistant_turn, lk)
+        if listing_extras.get("results_style") == "quick":
+            st.rerun()
         st.stop()
 
     with st.spinner("Running extraction and evaluation..."):
@@ -659,23 +789,17 @@ if user_input:
     assistant_turn = {
         "role": "assistant",
         "text": "Here is the extraction result.",
-        "first_json": first_extracted,
-        "second_json": second_json,
-        "json_caption_ev": "Second (Evaluator Corrected) JSON",
         "warning": warning_msg,
         **listing_extras,
     }
+    _append_listing_summary_to_assistant_text(assistant_turn, listing_extras)
     st.session_state.chat_history.append(assistant_turn)
 
     if not missing_required:
-        _maybe_autosave_completed_session(second_json)
+        _maybe_autosave_completed_session(second_json, listing_extras)
 
     with st.chat_message("assistant"):
         st.write(assistant_turn["text"])
-        st.caption("First Extracted JSON")
-        st.json(first_extracted)
-        st.caption(assistant_turn["json_caption_ev"])
-        st.json(second_json)
         if warning_msg:
             if missing_required:
                 st.warning(warning_msg)
@@ -685,3 +809,7 @@ if user_input:
         if not missing_required and listing_extras:
             lk = f"l{len(st.session_state.chat_history) - 1}"
             _render_message_listing_extras(assistant_turn, lk)
+
+    if listing_extras.get("results_style") == "quick":
+        st.rerun()
+    st.stop()

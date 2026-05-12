@@ -138,3 +138,24 @@ def region_from_city_field(city_text: Any) -> str:
     if not blob:
         return "Unknown"
     return _region_for_normalized_city(blob)
+
+
+def latlon_from_city_field(city_text: Any) -> tuple[float, float] | None:
+    """Approximate (lat, lon) for a listing `city` string via Geonames DE city match (same logic as region)."""
+    if city_text is None:
+        return None
+    blob = " ".join(str(city_text).split())
+    if not blob:
+        return None
+    hit = _best_de_hit_for_candidates(_city_name_candidates(blob))
+    if not hit:
+        return None
+    try:
+        lat = float(hit.get("latitude"))
+        lon = float(hit.get("longitude"))
+    except (TypeError, ValueError):
+        return None
+    # Rough Germany bounding box (excludes obvious wrong-country hits).
+    if not (47.0 <= lat <= 55.5 and 5.5 <= lon <= 15.5):
+        return None
+    return lat, lon

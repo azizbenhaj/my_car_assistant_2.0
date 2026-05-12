@@ -34,6 +34,13 @@ After a successful search you get **ranked listing cards**, metrics, charts/maps
 
 **Dataset CSV:** link in [`car_assistant/link_to_download_dataset.rtf`](car_assistant/link_to_download_dataset.rtf) — or [Google Drive](https://drive.google.com/file/d/1a58G-aLexDRJP_PzFN5qVcPrI4Hfu2rN/view?usp=sharing).
 
+## Example PDFs
+
+These files live in **`images/`** so you can open them directly from the repo.
+
+- **[Quick listing PDF](images/car_listings_quick.pdf)** — from a completed **Buy or sell** run (or the main **Download PDF** on that screen): top listings with photos/links plus the combined chart page.  
+- **[Sidebar listing PDF](images/Porsche_911_2026_6d70881e_listings.pdf)** — second vehicle dossier from **Sidebar → PDF** on a save (filename = label + session id). *The **Compare** screen’s download is **`car_listings_compare.pdf`** (multi-car layout); drop that export into `images/` and add a link if you want that exact sample in the README.*
+
 ## Run it
 
 ```bash
@@ -59,11 +66,4 @@ Use `--truncate-first` on the loader if you need to replace rows. See **`car_ass
 | **`car_assistant/`** | App (`main.py`, `graph.py`, listings, PDFs), `requirements.txt`, dataset RTF, CSV loader. |
 | **`images/`** | Screenshots and **example PDFs** (see below). |
 | **`draft/`** | Project notes. |
-
-## Example PDFs
-
-These files live in **`images/`** so you can open them directly from the repo.
-
-- **[Quick listing PDF](images/car_listings_quick.pdf)** — from a completed **Buy or sell** run (or the main **Download PDF** on that screen): top listings with photos/links plus the combined chart page.  
-- **[Sidebar listing PDF](images/Porsche_911_2026_6d70881e_listings.pdf)** — second vehicle dossier from **Sidebar → PDF** on a save (filename = label + session id). *The **Compare** screen’s download is **`car_listings_compare.pdf`** (multi-car layout); drop that export into `images/` and add a link if you want that exact sample in the README.*
 

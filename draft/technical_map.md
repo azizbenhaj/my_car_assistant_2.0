@@ -3,7 +3,7 @@
 ## Layout
 
 ```
-<repo>/README.md               → points here + draft/
+<repo>/README.md               → run, UI steps, dataset, stack, repo layout
 car_assistant/
   main.py                      max 10 saved sessions + compare up to 3 autosaved profiles
   graph.py                     LangGraph: extractor_agent → evaluator_agent
@@ -14,7 +14,6 @@ car_assistant/
   load_csv_to_postgres.py      CSV → Postgres via psql COPY
   autoscout_de_parsed.csv      Raw listing export
   requirements.txt             + psycopg[binary]
-  README.md                    Run + env + Postgres load + retrieval note
   .env.example                 DATABASE_URL, optional LISTINGS_TABLE
 draft/
   README.md                    Index + sync policy

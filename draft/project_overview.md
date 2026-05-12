@@ -22,7 +22,7 @@ Replace the **classic car-filter UI** used on marketplaces such as **[autoscout.
 
 Python 3.10+, Streamlit, LangGraph, LangChain ↔ Ollama, PostgreSQL + **`psql`** for bulk CSV ingest.
 
-Run from **`car_assistant/`**: `streamlit run main.py`; load data per `README.md` + `.env.example`.
+Run from **`car_assistant/`**: `streamlit run main.py`; load data per root **`README.md`** + **`car_assistant/.env.example`**.
 
 ## Constraints
 

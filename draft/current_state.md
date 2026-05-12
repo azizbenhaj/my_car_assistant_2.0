@@ -18,7 +18,7 @@
 | **Results in UI** | **Quick:** photo cards + **compact PDF**. **Deep:** horizontal **price bars**, **photo grid**, characteristic **table + URL links**, choropleth from **city** (**`geonamescache`** + PLZ fallback), km & **year vs price**, **deep PDF** (per-row photo + clickable link). |
 | **Deps** | **`psycopg[binary]>=3.1`**, **pandas**, **numpy**, **rapidfuzz**, **matplotlib**, **plotly**, **reportlab**, **pillow**, **geonamescache**. |
 | **Repo hygiene** | `car_assistant/.gitignore`; **`.env.example`** — `DATABASE_URL`, optional `LISTINGS_TABLE`. |
-| **Docs** | `car_assistant/README.md` — env table includes `DATABASE_URL` for Streamlit retrieval. |
+| **Docs** | Root `README.md` — run commands, UI steps, dataset link. |
 
 ## Explicitly not implemented
 

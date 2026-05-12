@@ -8,7 +8,7 @@ Check off top-to-bottom unless you consciously parallelise.
 - [x] **Evaluator multi-pass** + **`EVALUATOR_MAX_PASSES`**; separate **`EVALUATOR_LLM_MODEL`** / **`OLLAMA_BASE_URL`** support.
 - [x] **Follow-up UX** — augmented query string with prior JSON for missing-slot turns.
 - [x] **Postgres-only** data path documented; removed SQLite + Docker helper from repo.
-- [x] **`car_assistant/README.md`** + **`.env.example`** for Postgres + Ollama env vars.
+- [x] Root **`README.md`** + **`car_assistant/.env.example`** for Postgres + Ollama env vars.
 - [x] **`listings_retrieval.py`** + **`main.py`** wiring: top-50 parameterized Postgres query from evaluated JSON; **`st.dataframe`** when complete.
 
 ### 0 · Prerequisites

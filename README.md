@@ -18,11 +18,11 @@ In **Buy or sell a car**, you describe the vehicle in chat; the assistant fills 
 
 **Compare cars** uses your sidebar saves: pick **2 or 3** and run **Compare** to see overlaid charts and tables (no chat in this mode).
 
-![Compare cars — multiselect and comparison workspace](images/Screenshot%202026-05-12%20at%2016.33.20.png)
+![Compare cars — multiselect and comparison workspace](images/Screenshot%202026-05-12%20at%2016.34.26.png)
 
 After a successful search you get **ranked listing cards**, metrics, charts/maps where data allows, and **download** actions for reports.
 
-![Listings, analytics, and export actions](images/Screenshot%202026-05-12%20at%2016.34.26.png)
+![Listings, analytics, and export actions](images/Screenshot%202026-05-12%20at%2016.33.20.png)
 
 ## How to use the interface (short)
 
